@@ -1,0 +1,5 @@
+camera.json
+stream.log
+*.h264
+__pycache__/
+*.pyc
