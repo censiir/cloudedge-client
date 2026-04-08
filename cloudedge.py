@@ -42,6 +42,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import struct
@@ -49,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -981,9 +983,128 @@ class CloudEdgeClient:
 
         _log(f'Done: {self.frame_count} frames, {self.total_bytes} bytes')
 
-    def stream_rtsp(self, rtsp_url: str, duration_sec: int = 0) -> None:
+    def _is_local_rtsp(self, rtsp_url: str) -> Tuple[bool, Optional[str], int]:
+        parsed = urllib.parse.urlparse(rtsp_url)
+        host = parsed.hostname
+        port = parsed.port or 8554
+        is_local = host in ('localhost', '127.0.0.1', '::1')
+        return is_local, host, port
+
+    def _port_open(self, host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _stop_existing_mediamtx(self) -> None:
+        """Stop existing mediamtx instances to avoid stale/bad state."""
+        try:
+            out = subprocess.check_output(['pgrep', '-x', 'mediamtx'], text=True)
+        except Exception:
+            return
+
+        pids = [int(x) for x in out.split() if x.strip().isdigit()]
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            alive = False
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                    break
+                except OSError:
+                    continue
+            if not alive:
+                break
+            time.sleep(0.1)
+
+    def _ensure_mediamtx(self, rtsp_url: str,
+                         mediamtx_config: Optional[str],
+                         force_restart: bool = True) -> Optional[subprocess.Popen]:
+        is_local, host, port = self._is_local_rtsp(rtsp_url)
+        if not is_local or not host:
+            return None
+
+        if force_restart:
+            _log('Restarting mediamtx to ensure clean RTSP state')
+            self._stop_existing_mediamtx()
+
+        if self._port_open(host, port):
+            _log(f'mediamtx already listening on {host}:{port}')
+            return None
+
+        mediamtx_bin = shutil.which('mediamtx')
+        if not mediamtx_bin:
+            _log('mediamtx not found in PATH; RTSP publish may fail')
+            return None
+
+        # Resolve config path from common locations so auto-start works
+        # whether the script is run from repo root or cloudedge-client/.
+        cfg_path: Optional[str] = None
+        if mediamtx_config:
+            candidates = []
+            if os.path.isabs(mediamtx_config):
+                candidates.append(mediamtx_config)
+            else:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                candidates.extend([
+                    os.path.join(os.getcwd(), mediamtx_config),
+                    os.path.join(script_dir, mediamtx_config),
+                    os.path.join(os.path.dirname(script_dir), mediamtx_config),
+                ])
+            for c in candidates:
+                if os.path.exists(c):
+                    cfg_path = c
+                    break
+
+        cmd = [mediamtx_bin]
+        if cfg_path:
+            cmd.append(cfg_path)
+            _log(f'Using mediamtx config: {cfg_path}')
+        else:
+            _log('mediamtx config not found; using builtin defaults')
+
+        _log('Starting mediamtx automatically')
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if self._port_open(host, port):
+                _log(f'mediamtx started on {host}:{port}')
+                return proc
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        _log('mediamtx did not start successfully')
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return None
+
+    def stream_rtsp(self, rtsp_url: str, duration_sec: int = 0,
+                    mediamtx_auto: bool = True,
+                    mediamtx_config: Optional[str] = 'mediamtx.yml',
+                    mediamtx_force_restart: bool = True) -> None:
         """Stream video to an RTSP server, restarting ffmpeg on reconnect."""
         _log(f'RTSP mode → {rtsp_url}')
+        mediamtx_proc: Optional[subprocess.Popen] = None
+        if mediamtx_auto:
+            mediamtx_proc = self._ensure_mediamtx(
+                rtsp_url,
+                mediamtx_config,
+                force_restart=mediamtx_force_restart,
+            )
+
         start = time.time()
         magic = struct.pack('>I', _PPCS_MAGIC)
         buf = bytearray()
@@ -1135,6 +1256,8 @@ class CloudEdgeClient:
                     del buf[:total]
         finally:
             _stop_ffmpeg()
+            if mediamtx_proc and mediamtx_proc.poll() is None:
+                _log('Leaving auto-started mediamtx running')
 
         _log(f'Done: {self.frame_count} frames, {self.total_bytes} bytes')
 
@@ -1169,6 +1292,13 @@ def main() -> int:
     ap.add_argument('--rtsp', metavar='URL',
                     help='Publish to RTSP server via ffmpeg '
                          '(e.g. rtsp://localhost:8554/camera)')
+    ap.add_argument('--no-mediamtx-auto', action='store_true',
+                    help='Do not auto-start mediamtx for local rtsp:// URLs')
+    ap.add_argument('--mediamtx-config', default='mediamtx.yml',
+                    help='mediamtx config path used when auto-starting '
+                         '(default: mediamtx.yml)')
+    ap.add_argument('--mediamtx-no-restart', action='store_true',
+                    help='Do not force-restart existing mediamtx process')
 
     args = ap.parse_args()
 
@@ -1201,7 +1331,13 @@ def main() -> int:
 
     try:
         if args.rtsp:
-            client.stream_rtsp(args.rtsp, args.duration)
+            client.stream_rtsp(
+                args.rtsp,
+                args.duration,
+                mediamtx_auto=not args.no_mediamtx_auto,
+                mediamtx_config=args.mediamtx_config,
+                mediamtx_force_restart=not args.mediamtx_no_restart,
+            )
         else:
             out: BinaryIO
             if args.output == '-':
